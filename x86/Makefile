@@ -495,7 +495,10 @@ TUTORIAL_PROOF_LOGS = $(TUTORIAL_PROOFS:.ml=.correct)
 
 # Build precompiled native binaries of HOL Light proofs
 
-proofs/simulator.native: proofs/simulator.ml ../common/cosim.ml ../common/sematest.ml $(BASE_ML) x86-insns.ml proofs/simulator_forms.ml ; ../tools/build-proof.sh proofs/simulator.ml "$(HOLLIGHT)" "$@"
+proofs/simulator.native: proofs/simulator.ml proofs/indirect_tests.ml ../common/cosim.ml ../common/sematest.ml $(BASE_ML) x86-insns.ml proofs/simulator_forms.ml ; ../tools/build-proof.sh proofs/simulator.ml "$(HOLLIGHT)" "$@"
+
+# Decoder and single-instruction contracts, without a hardware executor.
+proofs/indirect_tests.native: proofs/indirect_tests.ml $(BASE_ML) ; ../tools/build-proof.sh proofs/indirect_tests.ml "$(HOLLIGHT)" "$@"
 
 # For constant-time property and memory safety, collect input/output/temporary
 # buffers from function signatures in s2n-bignum.h .

@@ -268,6 +268,7 @@ let instruction_INDUCTION,instruction_RECURSION = define_type
    | BTS operand operand
    | CALL operand
    | CALL_ABSOLUTE (64 word)
+   | CALL_INDIRECT operand
    | CLC
    | CLD
    | CMC
@@ -278,6 +279,7 @@ let instruction_INDUCTION,instruction_RECURSION = define_type
    | IMUL3 operand (operand#operand)
    | IMUL2 (operand#operand) operand
    | INC operand
+   | JMP_INDIRECT operand
    | JUMP condition operand
    | LEA operand bsid
    | LZCNT operand operand

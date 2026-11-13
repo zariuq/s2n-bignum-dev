@@ -2797,7 +2797,8 @@ let add_load_event = define
 
 (*** note that this is in 64-bit mode (e.g. matters for ROL masking) ***)
 
-(*** We also only support relative jump  at the moment ***)
+(*** CALL and JUMP are relative, CALL_ABSOLUTE has a fixed target, and ***)
+(*** CALL_INDIRECT and JMP_INDIRECT take the value of the operand.     ***)
 
 let x86_execute = define
  `x86_execute instr s =
@@ -2934,6 +2935,12 @@ let x86_execute = define
          x86_CALL ip' s)
     | CALL_ABSOLUTE target ->
         x86_CALL target s
+    | CALL_INDIRECT target ->
+        // The target is read before the return address is pushed. As for
+        // RET, a non-canonical target, on which hardware raises #GP, is not
+        // treated specially, and neither is CET indirect branch tracking.
+        (add_load_event target s ,,
+         (\s. x86_CALL (read (OPERAND64 target s) s) s)) s
     | CLC ->
         x86_CLC s
     | CLD ->
@@ -2999,6 +3006,12 @@ let x86_execute = define
          | 32 -> x86_INC (OPERAND32 dest s)
          | 16 -> x86_INC (OPERAND16 dest s)
          | 8 -> x86_INC (OPERAND8 dest s)) s)) s
+    | JMP_INDIRECT target ->
+        // As for CALL_INDIRECT, the target is not checked
+        (add_load_event target s ,,
+         (\s. let ip' = read (OPERAND64 target s) s in
+              (events := CONS (EventJump (read RIP s,ip')) (read events s) ,,
+               RIP := ip') s)) s
     | JUMP cc off ->
         (events := CONS
           (EventJump

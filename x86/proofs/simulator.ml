@@ -14,6 +14,7 @@
 needs "common/cosim.ml";;
 needs "common/sematest.ml";;
 needs "x86/proofs/base.ml";;
+needs "x86/proofs/indirect_tests.ml";;
 
 let regfile = new_definition
  `regfile s =
@@ -1453,21 +1454,42 @@ verbose := false;;
  *** of memory assumptions to maximize their usability.
  ***)
 
+(*** A RIP-relative LEA gives a code address word(val(word(pc + a)) + b) ***)
+
+let WORD_VAL_CODE_ADDRESS = prove
+ (`word(val(word(x + a):N word) + b):N word = word(x + (a + b))`,
+  REWRITE_TAC[WORD_ADD; WORD_VAL; WORD_ADD_ASSOC]);;
+
 let extra_simp_tac =
-  (* pth and the last rule cancel code addresses, as in the call sequences *)
-  let pth = prove
-   (`word(val(word(x + a):N word) + b):N word = word(x + (a + b))`,
-    REWRITE_TAC[WORD_ADD; WORD_VAL; WORD_ADD_ASSOC]) in
+  (* WORD_VAL_CODE_ADDRESS and the last rule cancel code addresses, as in the
+     call sequences *)
   REWRITE_TAC[WORD_RULE `word_sub x (word_add x y):N word = word_neg y`;
               WORD_RULE `word_sub y (word_add x y):N word = word_neg x`;
               WORD_RULE `word_sub (word_add x y) x:N word = y`;
               WORD_RULE `word_sub (word_add x y) y:N word = x`;
               WORD_RULE `word_add x (word(1 * val(word_not (word_add x y)))) =
                          word_neg (word_add y (word 1):N word)`;
-              pth; INT_SUB_REFL;
+              WORD_VAL_CODE_ADDRESS; INT_SUB_REFL;
               WORD_RULE `word_sub (word(x + a)) (word(x + b)):N word =
                          word_sub (word a) (word b)`] THEN
   CONV_TAC(DEPTH_CONV WORD_NUM_RED_CONV) THEN REWRITE_TAC[];;
+
+(*** When an indirect branch puts such an address in RIP, reduce it to the
+ *** form word(pc + n) in which the step tactics find the next instruction.
+ ***)
+
+let rip_normalize_tac =
+  let conv =
+    GEN_REWRITE_CONV I [WORD_VAL_CODE_ADDRESS] THENC
+    RAND_CONV(RAND_CONV NUM_REDUCE_CONV) THENC
+    TRY_CONV WORD_PC_PLUS_CONV in
+  RULE_ASSUM_TAC(fun th ->
+    let tm = concl th in
+    if is_eq tm && is_read_rip(lhs tm)
+    then CONV_RULE(RAND_CONV(TRY_CONV conv)) th else th);;
+
+let steps_tac step_tac mc states =
+  MAP_EVERY (fun n -> step_tac mc [n] THEN rip_normalize_tac) states;;
 
 let extra_movsb_tac =
   FIRST_X_ASSUM(MP_TAC o MATCH_MP X86_REVERT_STRINGCOPY) THEN
@@ -1495,13 +1517,14 @@ and tac_main (memopidx: int option) mc states =
   begin match memopidx with
   | Some idx ->
     let states1, states2 = chop_list idx states in
-    (if states1 <> [] then X86_STEPS_TAC mc states1 else ALL_TAC) THEN
+    (if states1 <> [] then steps_tac X86_STEPS_TAC mc states1
+     else ALL_TAC) THEN
     (if states2 <> [] then
-       X86_VSTEPS_TAC mc [hd states2] THEN
+       steps_tac X86_VSTEPS_TAC mc [hd states2] THEN
        TRY extra_movsb_tac THEN
-       X86_VSTEPS_TAC mc (tl states2)
+       steps_tac X86_VSTEPS_TAC mc (tl states2)
      else ALL_TAC)
-  | None -> X86_STEPS_TAC mc states
+  | None -> steps_tac X86_STEPS_TAC mc states
   end
 and tac_after memop =
   (* MEMORY_SPLIT_TAC will split out the memory write to the stack.
@@ -1745,18 +1768,22 @@ let branch_iclasses =
 (* buffer. The result is the sequence and the number of steps.               *)
 (* ------------------------------------------------------------------------- *)
 
-let cosimulate_call_harness() =
-  let reg = let r = Random.int 15 in if r < 4 then r else r + 1 in
+(*** The tail after the return, with extra instructions before the CMP ***)
+
+let call_tail reg extra =
   let rex = if reg < 8 then 0x48 else 0x4c
   and modrm = 8 * (reg mod 8)
   and d = 4 * Random.bits() + Random.int 4 in
-  let tail =
-    [[rex; 0x8d; 0x05 + modrm; d land 0xff; (d lsr 8) land 0xff;
-      (d lsr 16) land 0xff; d lsr 24];                (* lea REG, [rip+d] *)
-     [rex; 0x2b; 0x44 + modrm; 0x24; 0xf8];           (* sub REG, [rsp-8] *)
-     [rex; 0x89; 0x44 + modrm; 0x24; 0xf8];           (* mov [rsp-8], REG *)
-     [rex + reg / 8; 0x39; 0xc0 + 9 * (reg mod 8)];   (* cmp REG, REG *)
-     [0x48; 0x8d; 0x64; 0x24; 0xf0]] in               (* lea rsp, [rsp-16] *)
+  [[rex; 0x8d; 0x05 + modrm; d land 0xff; (d lsr 8) land 0xff;
+    (d lsr 16) land 0xff; d lsr 24];                  (* lea REG, [rip+d] *)
+   [rex; 0x2b; 0x44 + modrm; 0x24; 0xf8];             (* sub REG, [rsp-8] *)
+   [rex; 0x89; 0x44 + modrm; 0x24; 0xf8]] @ extra @   (* mov [rsp-8], REG *)
+  [[rex + reg / 8; 0x39; 0xc0 + 9 * (reg mod 8)];     (* cmp REG, REG *)
+   [0x48; 0x8d; 0x64; 0x24; 0xf0]];;                  (* lea rsp, [rsp-16] *)
+
+let cosimulate_call_harness() =
+  let reg = let r = Random.int 15 in if r < 4 then r else r + 1 in
+  let tail = call_tail reg [] in
   if Random.bool() then
     (* Forward: call F; ...; jmp E; F: ret; E: *)
     [[0x48; 0x8d; 0x64; 0x24; 0x10];                  (* lea rsp, [rsp+16] *)
@@ -1768,16 +1795,140 @@ let cosimulate_call_harness() =
      [0xeb; 0x01]; [0xc3];                            (* jmp S; F: ret *)
      [0xe8; 0xfa; 0xff; 0xff; 0xff]] @ tail,9;;       (* S: call F *)
 
-(*** The call sequences are slow to simulate, so they are drawn rarely ***)
+(* ------------------------------------------------------------------------- *)
+(* Indirect calls and jumps (FF /2 and FF /4), whose target is the value of  *)
+(* the operand. A RIP-relative LEA puts the target, a code address, in REG   *)
+(* (any register but RSP). With form = Some(x,sib) it is also stored at      *)
+(* [rsp+x] and read from there, or if sib from [rbx+rcx*2^k+d] at the same   *)
+(* address, saving RBX in RDX meanwhile. A call can take its target from     *)
+(* the slot to which it then pushes the return address (x = -8). Code        *)
+(* addresses are removed afterwards by the call tail or, if keepflags, by    *)
+(* overwriting them with constants, which leaves the input flags to check;   *)
+(* a jump always does the latter. A jump skips an instruction that would     *)
+(* set a marker register. The result is the sequence and number of steps.    *)
+(* ------------------------------------------------------------------------- *)
+
+let le32 n = map (fun i -> (n lsr (8 * i)) land 0xff) (0--3);;
+
+let indirect_sequence call reg rexw form backward keepflags =
+  let rex = if reg < 8 then 0x48 else 0x4c
+  and modrm = 8 * (reg mod 8)
+  and opc = if call then 2 else 4
+  and pfx = if rexw then [0x48] else []
+  and nbytes l = itlist (fun i n -> length i + n) l 0
+  and imm32() = le32 (4 * Random.bits() + Random.int 4) in
+  let lea_rip d = [rex; 0x8d; 0x05 + modrm] @ le32 d   (* lea REG, [rip+d] *)
+  and store x = [rex; 0x89; 0x44 + modrm; 0x24; x land 0xff]
+                                                       (* mov [rsp+x], REG *)
+  and mov_imm() = [0x48 + reg / 8; 0xc7; 0xc0 + reg mod 8] @ imm32()
+                                                       (* mov REG, imm32 *)
+  and clear x = [0x48; 0xc7; 0x44; 0x24; x land 0xff] @ imm32() in
+                                                       (* mov [rsp+x], imm32 *)
+  let setup,operand,stored,restore =
+    match form with
+      None ->
+        [],(if reg < 8 then pfx else [if rexw then 0x49 else 0x41]) @
+           [0xff; 0xc0 + 8 * opc + reg mod 8],[],[]
+    | Some(x,false) ->
+        [],pfx @ (if x = 0 then [0xff; 0x04 + 8 * opc; 0x24]
+                  else [0xff; 0x44 + 8 * opc; 0x24; x land 0xff]),[store x],[]
+    | Some(x,true) ->
+        let b = Random.int (x + 1) and k = Random.int 4 in
+        let i = (x - b) / (1 lsl k) in
+        [[0x48; 0xc7; 0xc1] @ le32 i;                   (* mov rcx, i *)
+         [0x48; 0x89; 0xda];                            (* mov rdx, rbx *)
+         [0x48; 0x8d; 0x5c; 0x24; b]],                  (* lea rbx, [rsp+b] *)
+        pfx @ [0xff; 0x44 + 8 * opc; 64 * k + 0x0b; x - b - i * (1 lsl k)],
+        [store x],[[0x48; 0x89; 0xd3]] in               (* mov rbx, rdx *)
+  let pre = stored @ setup
+  and slot = match form with Some(x,_) when x <> -8 -> [x] | _ -> [] in
+  if call then
+    let after =
+      if keepflags then
+        restore @ [mov_imm(); clear(-8)] @ map clear slot @
+        [[0x48; 0x8d; 0x64; 0x24; 0xf0]]               (* lea rsp, [rsp-16] *)
+      else restore @ call_tail reg (map store slot) in
+    let nsteps = length pre + length after + 5 in
+    if backward then
+      (* lea rsp,[rsp+16]; jmp S; F: ret; S: lea REG,F; ...; call; ...; E: *)
+      [[0x48; 0x8d; 0x64; 0x24; 0x10]; [0xeb; 0x01]; [0xc3]; lea_rip(-8)] @
+      pre @ [operand] @ after,nsteps
+    else
+      (* lea rsp,[rsp+16]; lea REG,F; ...; call; ...; jmp E; F: ret; E: *)
+      [[0x48; 0x8d; 0x64; 0x24; 0x10];
+       lea_rip(nbytes pre + length operand + nbytes after + 2)] @
+      pre @ [operand] @ after @ [[0xeb; 0x01]; [0xc3]],nsteps
+  else
+    let after = [mov_imm()] @ map clear slot @ restore
+    and marker = [if reg = 0 then 0xbe else 0xb8; 1; 0; 0; 0] in
+    let skip = length operand + 5 in
+    if backward then
+      (* jmp A; B: ...; jmp E; A: lea REG,B; ...; jmp; mov MARKER,1; E: *)
+      [[0xeb; nbytes after + 2]] @ after @
+      [[0xeb; nbytes pre + skip + 7]; lea_rip(-(nbytes after + 9))] @
+      pre @ [operand; marker],length pre + length after + 4
+    else
+      (* lea REG,L; ...; jmp; mov MARKER,1; L: ...; E: *)
+      [lea_rip(nbytes pre + skip)] @ pre @ [operand; marker] @ after,
+      length pre + length after + 2;;
+
+(*** A random case, with a register that is not RSP and, for the
+ *** [rbx+rcx*2^k+d] form, none of RBX, RCX and RDX either. The result
+ *** also gives memopidx, Some 1 if the sequence accesses memory. ***)
+
+let cosimulate_indirect_harness() =
+  let call = Random.bool() in
+  let form = match Random.int 4 with
+      0 -> None
+    | 1 -> Some(8 * Random.int 16,false)
+    | 2 -> Some(8 * Random.int 16,true)
+    | _ -> Some((if call then -8 else 0),false) in
+  let regs = filter (fun r -> r <> 4 &&
+                       not (form <> None && snd(option_get form) &&
+                            1 <= r && r <= 3)) (0--15) in
+  let reg = el (Random.int (length regs)) regs in
+  let ibytes_list,nsteps =
+    indirect_sequence call reg (Random.bool()) form (Random.bool())
+                      (Random.bool()) in
+  ibytes_list,nsteps,(if call || form <> None then Some 1 else None);;
+
+(* Exercise the new semantics even when a short seeded campaign draws no
+   indirect branch. Keep the ordinary random stream reproducible. *)
+
+let run_indirect_smoke_tests() =
+  let saved_random = Random.get_state() in
+  let restore() = Random.set_state saved_random in
+  let cases =
+    [true,15,false,None,false,true;
+     true,0,true,Some(-8,false),true,true;
+     false,11,false,None,true,false;
+     false,15,true,Some(8,false),false,false] in
+  Random.init 0;
+  try
+    List.iter (fun (call,reg,rexw,form,backward,keepflags) ->
+      let bytes,steps = indirect_sequence call reg rexw form backward keepflags in
+      let decoded,ok = cosimulate_instructions_steps (Some steps)
+        (if call || form <> None then Some 1 else None) 0 bytes in
+      let trapped = is_numeral decoded ||
+        (try is_numeral(hd(dest_list decoded)) with Failure _ -> false) in
+      if not ok || cosim_take_skipped() <> [] || trapped then
+        failwith "indirect branch smoke test") cases;
+    restore();
+    Printf.printf "Indirect branch smoke tests: %d passed\n%!" (length cases)
+  with error -> restore(); raise error;;
+
+(*** The call and indirect sequences are slow to simulate, so they are drawn
+ *** rarely ***)
 
 let run_random_branchsimulation () =
-  if Random.int 16 = 0 then
-    let ibytes_list,nsteps = cosimulate_call_harness() in
-    cosimulate_instructions_steps (Some nsteps) (Some 1) 0 ibytes_list
-  else
-    let ibytes_list,nsteps = el (Random.int (length branch_iclasses))
-                                branch_iclasses in
-    cosimulate_instructions_steps (Some nsteps) None 0 ibytes_list;;
+  match Random.int 16 with
+    0 -> let ibytes_list,nsteps = cosimulate_call_harness() in
+         cosimulate_instructions_steps (Some nsteps) (Some 1) 0 ibytes_list
+  | 1 -> let ibytes_list,nsteps,memopidx = cosimulate_indirect_harness() in
+         cosimulate_instructions_steps (Some nsteps) memopidx 0 ibytes_list
+  | _ -> let ibytes_list,nsteps = el (Random.int (length branch_iclasses))
+                                     branch_iclasses in
+         cosimulate_instructions_steps (Some nsteps) None 0 ibytes_list;;
 
 (* ------------------------------------------------------------------------- *)
 (* Setting up safe self-contained tests for memory accessing instructions.   *)
@@ -2420,6 +2571,7 @@ let rec run_random_simulations start_t =
  ***)
 
 sematest_random_init ();;
+run_indirect_smoke_tests ();;
 
 let start_t = Unix.gettimeofday() (* unit is sec *) in
   match run_random_simulations start_t with
